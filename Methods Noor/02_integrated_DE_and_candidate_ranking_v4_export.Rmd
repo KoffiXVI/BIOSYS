@@ -1,0 +1,1382 @@
+---
+title: "Integrated differential-expression analysis and candidate ranking"
+author: "Adapted from ENS practical scripts"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(fig.align="center", fig.width=8, fig.height=6)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(limma)
+  library(dplyr)
+  library(ggplot2)
+})
+
+theme_set(theme_classic())
+
+# ================= USER SETTINGS =================
+
+count_file <- "/shared/projects/tp_2636_usorbonne_geno_transcriptomic_184414/data/rnaseq/count_data_diffAnalysis_no0counts.txt"
+design_file <- "/shared/projects/tp_2636_usorbonne_geno_transcriptomic_184414/data/rnaseq/design.txt"
+microarray_file <- "/shared/projects/tp_2636_usorbonne_geno_transcriptomic_184414/data/microarrays/dataFile_diffAnalysis.txt"
+
+# Main plotting/filtering cutoffs for comparison with the practical.
+alpha_main <- 0.01
+lfc_visual <- 2
+
+# More biologically moderate effect threshold for formal effect-size testing.
+lfc_test <- 1     # |log2FC| > 1 = >2-fold
+
+# Gene that must not be selected.
+excluded_gene <- "CPAR2_404850"
+
+# Starting candidates; final ranking is data-driven.
+candidate_genes <- c(
+  "CPAR2_603610",
+  "CPAR2_100710",
+  "CPAR2_201490",
+  "CPAR2_405010",
+  "CPAR2_203450"
+)
+
+# Computational switches
+run_leave_one_out <- TRUE
+run_edgeR <- TRUE
+run_weight_sensitivity <- TRUE
+n_weight_draws <- 5000
+
+set.seed(2026)
+```
+
+# 1. Load and validate RNA-seq
+
+```{r load_rna}
+countData <- read.table(
+  count_file,
+  row.names = 1,
+  header = TRUE,
+  check.names = FALSE
+)
+
+colData <- read.table(
+  design_file,
+  row.names = 1,
+  header = TRUE,
+  check.names = FALSE
+)
+
+stopifnot(all(colnames(countData) %in% rownames(colData)))
+colData <- colData[colnames(countData), , drop = FALSE]
+stopifnot(identical(colnames(countData), rownames(colData)))
+
+colData$condition <- factor(colData$condition)
+if ("N" %in% levels(colData$condition)) {
+  colData$condition <- relevel(colData$condition, ref = "N")
+}
+
+print(table(colData$condition))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = round(as.matrix(countData)),
+  colData = colData,
+  design = ~ condition
+)
+dds <- DESeq(dds)
+
+print(resultsNames(dds))
+```
+
+# 2. Main DESeq2 results
+
+```{r deseq_results}
+res_obj <- results(
+  dds,
+  contrast = c("condition", "H", "N"),
+  alpha = alpha_main
+)
+
+res <- as.data.frame(res_obj)
+res$gene <- rownames(res)
+
+summary(res_obj)
+
+res <- res |>
+  mutate(
+    direction = case_when(
+      log2FoldChange > 0 ~ "Hypoxia induced",
+      log2FoldChange < 0 ~ "Normoxia induced",
+      TRUE ~ "No direction"
+    ),
+    neglog10padj = -log10(pmax(padj, .Machine$double.xmin)),
+    precision = abs(log2FoldChange) / lfcSE
+  )
+```
+
+# 3. P-value diagnostics
+
+```{r pvalue_hist}
+ggplot(res, aes(pvalue)) +
+  geom_histogram(bins = 100) +
+  labs(
+    title = "RNA-seq p-value distribution",
+    x = "Raw p-value",
+    y = "Genes"
+  )
+```
+
+# 4. Volcano plot using named columns
+
+```{r volcano, message=FALSE, warning=FALSE}
+if (requireNamespace("EnhancedVolcano", quietly = TRUE)) {
+  EnhancedVolcano::EnhancedVolcano(
+    res,
+    lab = res$gene,
+    x = "log2FoldChange",
+    y = "padj",
+    selectLab = unique(c(candidate_genes, excluded_gene)),
+    FCcutoff = lfc_visual,
+    pCutoff = alpha_main,
+    title = "RNA-seq: Hypoxia vs Normoxia",
+    subtitle = "Selected candidates labelled",
+    pointSize = 2,
+    labSize = 4,
+    drawConnectors = TRUE
+  )
+} else {
+  ggplot(res, aes(log2FoldChange, neglog10padj)) +
+    geom_point(alpha = 0.35) +
+    geom_vline(xintercept = c(-lfc_visual, lfc_visual), linetype = 2) +
+    geom_hline(yintercept = -log10(alpha_main), linetype = 2) +
+    labs(
+      title = "RNA-seq volcano plot",
+      x = "log2 fold change (H/N)",
+      y = "-log10 adjusted p-value"
+    )
+}
+```
+
+# 5. MA plot
+
+```{r ma}
+plotMA(
+  res_obj,
+  alpha = alpha_main,
+  ylim = c(-6, 6),
+  main = paste0("RNA-seq MA plot; FDR < ", alpha_main)
+)
+abline(h = c(-1, 1), lty = 2)
+```
+
+# 6. Log2 fold-change shrinkage
+
+`apeglm` is preferred when installed. If unavailable, the script falls back to DESeq2's normal shrinkage.
+
+```{r shrinkage}
+coef_names <- resultsNames(dds)
+coef_HN <- grep("condition_H_vs_N", coef_names, value = TRUE)
+
+if (length(coef_HN) != 1) {
+  stop(
+    "Could not find coefficient condition_H_vs_N. Check resultsNames(dds) and factor coding."
+  )
+}
+
+if (requireNamespace("apeglm", quietly = TRUE)) {
+  shrink_type <- "apeglm"
+} else {
+  shrink_type <- "normal"
+  message("Package 'apeglm' not installed; using type='normal'. Install apeglm for the preferred analysis.")
+}
+
+res_shrunk_obj <- lfcShrink(
+  dds,
+  coef = coef_HN,
+  type = shrink_type
+)
+
+res_shrunk <- as.data.frame(res_shrunk_obj)
+res_shrunk$gene <- rownames(res_shrunk)
+
+res$shrunkLFC <- res_shrunk[res$gene, "log2FoldChange"]
+
+ggplot(res, aes(log2FoldChange, shrunkLFC)) +
+  geom_point(alpha = 0.25) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  labs(
+    title = paste("Raw vs shrunken log2FC —", shrink_type),
+    x = "Raw DESeq2 log2FC",
+    y = "Shrunken log2FC"
+  )
+```
+
+# 7. Formal effect-size testing
+
+Rather than testing only `LFC != 0` and applying a hard fold-change cutoff afterward, test whether `|LFC|` exceeds a biologically meaningful threshold.
+
+```{r effect_test}
+res_effect_obj <- results(
+  dds,
+  contrast = c("condition", "H", "N"),
+  lfcThreshold = lfc_test,
+  altHypothesis = "greaterAbs",
+  alpha = 0.05
+)
+
+res_effect <- as.data.frame(res_effect_obj)
+res_effect$gene <- rownames(res_effect)
+res$effectTestPadj <- res_effect[res$gene, "padj"]
+
+cat(
+  "Genes with evidence that |log2FC| >", lfc_test,
+  "at FDR < 0.05:",
+  sum(res$effectTestPadj < 0.05, na.rm = TRUE),
+  "\n"
+)
+```
+
+# 8. Optional apeglm s-values
+
+```{r svalues}
+res$svalue <- NA_real_
+
+if (requireNamespace("apeglm", quietly = TRUE)) {
+  s_obj <- lfcShrink(
+    dds,
+    coef = coef_HN,
+    type = "apeglm",
+    lfcThreshold = lfc_test,
+    svalue = TRUE
+  )
+  s_df <- as.data.frame(s_obj)
+  s_df$gene <- rownames(s_df)
+  if ("svalue" %in% colnames(s_df)) {
+    res$svalue <- s_df[res$gene, "svalue"]
+  }
+}
+```
+
+# 9. Abundance, uncertainty and Cook's distance
+
+```{r uncertainty}
+cooks <- assays(dds)[["cooks"]]
+maxCook <- apply(cooks, 1, max, na.rm = TRUE)
+res$maxCook <- maxCook[res$gene]
+
+ggplot(res, aes(log10(baseMean + 1), abs(shrunkLFC))) +
+  geom_point(alpha = 0.25) +
+  labs(
+    title = "Effect magnitude versus abundance",
+    x = "log10(baseMean + 1)",
+    y = "|shrunken log2FC|"
+  )
+
+ggplot(res, aes(abs(shrunkLFC), lfcSE)) +
+  geom_point(alpha = 0.25) +
+  labs(
+    title = "Effect magnitude versus uncertainty",
+    x = "|shrunken log2FC|",
+    y = "DESeq2 log2FC SE"
+  )
+```
+
+# 10. Candidate-level replicate plots
+
+```{r candidate_plots, fig.height=5}
+vsd <- vst(dds, blind = FALSE)
+candidate_present <- intersect(candidate_genes, rownames(dds))
+
+for (g in candidate_present) {
+  dat <- plotCounts(
+    dds,
+    gene = g,
+    intgroup = "condition",
+    returnData = TRUE
+  )
+
+  p <- ggplot(dat, aes(condition, count)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.08, size = 2.8) +
+    scale_y_log10() +
+    labs(
+      title = paste("Normalized RNA-seq counts:", g),
+      x = "Condition",
+      y = "Normalized count (log10)"
+    )
+  print(p)
+}
+```
+
+# 11. Threshold-sensitivity grid
+
+This shows how many genes would be called significant under many reasonable choices instead of one arbitrary threshold.
+
+```{r threshold_grid}
+fdr_grid <- c(0.001, 0.005, 0.01, 0.05, 0.10)
+lfc_grid <- c(0, 0.5, 1, 1.5, 2, 2.5)
+
+grid <- expand.grid(
+  FDR = fdr_grid,
+  absLFC = lfc_grid
+)
+
+grid$n_genes <- mapply(
+  function(a, l) {
+    sum(res$padj < a & abs(res$shrunkLFC) > l, na.rm = TRUE)
+  },
+  grid$FDR,
+  grid$absLFC
+)
+
+ggplot(grid, aes(factor(absLFC), factor(FDR), fill = n_genes)) +
+  geom_tile() +
+  geom_text(aes(label = n_genes)) +
+  labs(
+    title = "Number of selected genes across threshold choices",
+    x = "|shrunken log2FC| cutoff",
+    y = "FDR cutoff",
+    fill = "Genes"
+  )
+```
+
+Candidate stability across thresholds:
+
+```{r candidate_threshold_stability}
+cand_threshold <- expand.grid(
+  gene = candidate_present,
+  FDR = fdr_grid,
+  absLFC = lfc_grid
+)
+
+cand_threshold <- cand_threshold |>
+  rowwise() |>
+  mutate(
+    selected = {
+      rr <- res[match(gene, res$gene), ]
+      !is.na(rr$padj) &&
+        rr$padj < FDR &&
+        abs(rr$shrunkLFC) > absLFC
+    }
+  ) |>
+  ungroup()
+
+ggplot(
+  cand_threshold,
+  aes(factor(absLFC), factor(FDR), fill = selected)
+) +
+  geom_tile() +
+  facet_wrap(~ gene) +
+  labs(
+    title = "Candidate robustness to threshold choices",
+    x = "|shrunken log2FC| cutoff",
+    y = "FDR cutoff"
+  )
+```
+
+# 12. Leave-one-sample-out robustness
+
+This is intentionally slower. It refits DESeq2 once per omitted sample.
+
+```{r leave_one_out}
+loo_summary <- NULL
+
+if (run_leave_one_out) {
+  samples <- colnames(countData)
+
+  loo_list <- lapply(samples, function(s) {
+    keep_samples <- setdiff(samples, s)
+
+    tmp_counts <- countData[, keep_samples, drop = FALSE]
+    tmp_meta <- colData[keep_samples, , drop = FALSE]
+
+    tmp_dds <- DESeqDataSetFromMatrix(
+      countData = round(as.matrix(tmp_counts)),
+      colData = tmp_meta,
+      design = ~ condition
+    )
+    tmp_dds <- DESeq(tmp_dds, quiet = TRUE)
+
+    tmp <- as.data.frame(
+      results(
+        tmp_dds,
+        contrast = c("condition", "H", "N"),
+        alpha = 0.05
+      )
+    )
+
+    tmp$gene <- rownames(tmp)
+    tmp$removed_sample <- s
+
+    tmp <- tmp |>
+      filter(!is.na(log2FoldChange)) |>
+      mutate(
+        absLFC = abs(log2FoldChange),
+        rank_absLFC = rank(-absLFC, ties.method = "average")
+      )
+
+    tmp
+  })
+
+  loo <- bind_rows(loo_list)
+
+  loo_summary <- loo |>
+    group_by(gene) |>
+    summarise(
+      loo_medianLFC = median(log2FoldChange, na.rm = TRUE),
+      loo_sdLFC = sd(log2FoldChange, na.rm = TRUE),
+      loo_minLFC = min(log2FoldChange, na.rm = TRUE),
+      loo_maxLFC = max(log2FoldChange, na.rm = TRUE),
+      loo_propFDR05 = mean(padj < 0.05, na.rm = TRUE),
+      loo_medianRank = median(rank_absLFC, na.rm = TRUE),
+      loo_worstRank = max(rank_absLFC, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  print(
+    loo_summary |>
+      filter(gene %in% candidate_present) |>
+      arrange(loo_medianRank)
+  )
+
+  ggplot(
+    loo |> filter(gene %in% candidate_present),
+    aes(gene, log2FoldChange)
+  ) +
+    geom_boxplot() +
+    coord_flip() +
+    labs(
+      title = "Candidate log2FC under leave-one-sample-out refits",
+      x = NULL,
+      y = "log2FC (H/N)"
+    )
+}
+```
+
+# 13. Independent RNA-seq analysis with edgeR
+
+```{r edger}
+edgeR_table <- NULL
+
+if (run_edgeR) {
+  if (requireNamespace("edgeR", quietly = TRUE)) {
+    group <- factor(colData$condition)
+
+    y <- edgeR::DGEList(
+      counts = countData,
+      group = group
+    )
+
+    keep <- edgeR::filterByExpr(y, group = group)
+    y <- y[keep, , keep.lib.sizes = FALSE]
+    y <- edgeR::calcNormFactors(y, method = "TMM")
+
+    design <- model.matrix(~ group)
+    y <- edgeR::estimateDisp(y, design)
+    fit <- edgeR::glmQLFit(y, design)
+
+    coef_index <- ncol(design)
+    qlf <- edgeR::glmQLFTest(fit, coef = coef_index)
+
+    edgeR_table <- edgeR::topTags(qlf, n = Inf)$table
+    edgeR_table$gene <- rownames(edgeR_table)
+
+    # Ensure edgeR orientation is H/N; reverse if the coefficient is N-H.
+    coef_name <- colnames(design)[coef_index]
+    if (grepl("groupN", coef_name)) {
+      edgeR_table$logFC <- -edgeR_table$logFC
+    }
+
+    edgeR_table$edgeR_rank <- rank(
+      -abs(edgeR_table$logFC),
+      ties.method = "average"
+    )
+
+    ggplot(
+      merge(
+        res[, c("gene", "shrunkLFC")],
+        edgeR_table[, c("gene", "logFC")],
+        by = "gene"
+      ),
+      aes(shrunkLFC, logFC)
+    ) +
+      geom_point(alpha = 0.25) +
+      geom_abline(slope = 1, intercept = 0, linetype = 2) +
+      labs(
+        title = "DESeq2 vs edgeR effect estimates",
+        x = "DESeq2 shrunken log2FC",
+        y = "edgeR log2FC"
+      )
+  } else {
+    message("edgeR is not installed; skipping independent RNA-seq analysis.")
+  }
+}
+```
+
+# 14. Load and analyse microarray ratios with limma
+
+The supplied microarray matrix contains replicate **log(H/N) ratios**, so the intercept-only `lmFit(data)` model asks whether the average log-ratio differs from zero.
+
+```{r microarray}
+array_data <- as.matrix(
+  read.table(
+    microarray_file,
+    row.names = 1,
+    header = TRUE,
+    check.names = FALSE
+  )
+)
+
+fit_array <- lmFit(array_data)
+
+# Standard empirical Bayes (matches the practical logic).
+fit_ebayes <- eBayes(fit_array)
+array_standard <- topTable(
+  fit_ebayes,
+  number = Inf,
+  sort.by = "P"
+)
+array_standard$gene <- rownames(array_standard)
+
+# Robust sensitivity analysis.
+fit_robust <- eBayes(fit_array, robust = TRUE)
+array_robust <- topTable(
+  fit_robust,
+  number = Inf,
+  sort.by = "P"
+)
+array_robust$gene <- rownames(array_robust)
+
+# Effect-size test: mean |log ratio| > lfc_test.
+fit_treat <- treat(
+  fit_array,
+  lfc = lfc_test
+)
+array_treat <- topTreat(
+  fit_treat,
+  number = Inf
+)
+array_treat$gene <- rownames(array_treat)
+
+# Replicate-level consistency.
+array_rep_stats <- data.frame(
+  gene = rownames(array_data),
+  array_mean = rowMeans(array_data, na.rm = TRUE),
+  array_sd = apply(array_data, 1, sd, na.rm = TRUE),
+  array_min = apply(array_data, 1, min, na.rm = TRUE),
+  array_max = apply(array_data, 1, max, na.rm = TRUE)
+)
+
+head(array_standard)
+```
+
+# 15. Visualize microarray replicate consistency
+
+```{r array_candidate_reps, fig.height=5}
+array_candidate_present <- intersect(candidate_genes, rownames(array_data))
+
+for (g in array_candidate_present) {
+  df <- data.frame(
+    replicate = colnames(array_data),
+    log_ratio = as.numeric(array_data[g, ])
+  )
+
+  p <- ggplot(df, aes(replicate, log_ratio, group = 1)) +
+    geom_hline(yintercept = 0, linetype = 2) +
+    geom_point(size = 3) +
+    geom_line() +
+    labs(
+      title = paste("Microarray replicate log(H/N):", g),
+      x = "Biological replicate",
+      y = "Normalized log ratio"
+    )
+  print(p)
+}
+```
+
+# 16. Compare standard limma, robust limma and TREAT
+
+```{r limma_compare}
+array_compare <- array_standard |>
+  select(gene, logFC, adj.P.Val) |>
+  rename(
+    array_logFC = logFC,
+    array_FDR_standard = adj.P.Val
+  ) |>
+  left_join(
+    array_robust |>
+      select(gene, adj.P.Val) |>
+      rename(array_FDR_robust = adj.P.Val),
+    by = "gene"
+  ) |>
+  left_join(
+    array_treat |>
+      select(gene, adj.P.Val) |>
+      rename(array_FDR_treat = adj.P.Val),
+    by = "gene"
+  ) |>
+  left_join(array_rep_stats, by = "gene")
+
+print(
+  array_compare |>
+    filter(gene %in% candidate_genes)
+)
+```
+
+# 17. Integrate RNA-seq and microarray
+
+```{r cross_platform}
+merged <- res |>
+  select(
+    gene, baseMean, log2FoldChange, shrunkLFC, lfcSE, padj,
+    effectTestPadj, svalue, maxCook
+  ) |>
+  left_join(array_compare, by = "gene")
+
+merged <- merged |>
+  mutate(
+    direction_same =
+      !is.na(array_logFC) &
+      sign(shrunkLFC) == sign(array_logFC),
+    platform_difference = abs(shrunkLFC - array_logFC),
+    mean_effect = rowMeans(
+      cbind(shrunkLFC, array_logFC),
+      na.rm = TRUE
+    )
+  )
+
+cat("Cross-platform Pearson correlation:\n")
+print(
+  cor(
+    merged$shrunkLFC,
+    merged$array_logFC,
+    method = "pearson",
+    use = "complete.obs"
+  )
+)
+
+cat("Cross-platform Spearman correlation:\n")
+print(
+  cor(
+    merged$shrunkLFC,
+    merged$array_logFC,
+    method = "spearman",
+    use = "complete.obs"
+  )
+)
+```
+
+# 18. RNA-seq versus microarray scatter
+
+```{r platform_scatter}
+ggplot(
+  merged,
+  aes(shrunkLFC, array_logFC)
+) +
+  geom_point(alpha = 0.25) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  labs(
+    title = "RNA-seq vs microarray hypoxia response",
+    x = "DESeq2 shrunken log2FC (H/N)",
+    y = "Microarray mean log(H/N)"
+  )
+```
+
+# 19. Bland-Altman-style platform agreement
+
+```{r bland_altman}
+ba <- merged |>
+  filter(
+    is.finite(shrunkLFC),
+    is.finite(array_logFC)
+  ) |>
+  mutate(
+    platform_mean = (shrunkLFC + array_logFC) / 2,
+    platform_diff = shrunkLFC - array_logFC
+  )
+
+ggplot(ba, aes(platform_mean, platform_diff)) +
+  geom_point(alpha = 0.25) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  labs(
+    title = "Cross-platform agreement",
+    x = "Mean effect across platforms",
+    y = "RNA-seq effect - microarray effect"
+  )
+```
+
+# 20. Find cross-platform discordant genes
+
+```{r discordance}
+discordant <- merged |>
+  filter(
+    !is.na(array_logFC),
+    abs(shrunkLFC) >= 1,
+    abs(array_logFC) >= 1,
+    !direction_same
+  ) |>
+  arrange(desc(abs(shrunkLFC - array_logFC)))
+
+head(discordant, 30)
+```
+
+# 21. Find genes excluded by the practical's hard cutoff but promising now
+
+```{r rescued}
+merged <- merged |>
+  mutate(
+    practical_selected =
+      !is.na(padj) &
+      padj < alpha_main &
+      abs(log2FoldChange) > lfc_visual,
+
+    modern_strong =
+      !is.na(padj) &
+      padj < 0.05 &
+      abs(shrunkLFC) > 1 &
+      !is.na(array_FDR_standard) &
+      array_FDR_standard < 0.05 &
+      direction_same
+  )
+
+rescued <- merged |>
+  filter(
+    !practical_selected,
+    modern_strong,
+    gene != excluded_gene
+  ) |>
+  arrange(padj)
+
+head(rescued, 30)
+```
+
+# 22. Find fragile hits from the original filter
+
+```{r fragile}
+fragile <- merged |>
+  filter(
+    practical_selected,
+    gene != excluded_gene
+  ) |>
+  mutate(
+    low_abundance = baseMean < quantile(baseMean, 0.20, na.rm = TRUE),
+    high_uncertainty = lfcSE > quantile(lfcSE, 0.80, na.rm = TRUE),
+    poor_platform_support =
+      is.na(array_FDR_standard) |
+      array_FDR_standard >= 0.05 |
+      !direction_same
+  ) |>
+  filter(
+    low_abundance |
+    high_uncertainty |
+    poor_platform_support
+  ) |>
+  arrange(desc(high_uncertainty), desc(poor_platform_support))
+
+head(fragile, 30)
+```
+
+# 23. Add leave-one-out and edgeR evidence
+
+```{r merge_extra}
+master <- merged
+
+if (!is.null(loo_summary)) {
+  master <- master |>
+    left_join(loo_summary, by = "gene")
+}
+
+if (!is.null(edgeR_table)) {
+  master <- master |>
+    left_join(
+      edgeR_table |>
+        select(gene, edgeR_logFC = logFC, edgeR_FDR = FDR, edgeR_rank),
+      by = "gene"
+    )
+}
+```
+
+# 24. Rank-product consensus
+
+Ranks are more robust than directly combining incomparable p-value scales.
+
+```{r rank_product}
+rank_high <- function(x) {
+  rank(-x, ties.method = "average", na.last = "keep")
+}
+
+rank_low <- function(x) {
+  rank(x, ties.method = "average", na.last = "keep")
+}
+
+master <- master |>
+  mutate(
+    rank_DESeq2_effect = rank_high(abs(shrunkLFC)),
+    rank_DESeq2_FDR = rank_low(padj),
+    rank_array_effect = rank_high(abs(array_logFC)),
+    rank_array_FDR = rank_low(array_FDR_standard)
+  )
+
+rank_cols <- c(
+  "rank_DESeq2_effect",
+  "rank_DESeq2_FDR",
+  "rank_array_effect",
+  "rank_array_FDR"
+)
+
+if ("edgeR_rank" %in% colnames(master)) {
+  rank_cols <- c(rank_cols, "edgeR_rank")
+}
+
+rank_mat <- as.matrix(master[, rank_cols, drop = FALSE])
+
+master$rank_product <- apply(
+  rank_mat,
+  1,
+  function(x) {
+    x <- x[is.finite(x)]
+    if (length(x) < 2) return(NA_real_)
+    exp(mean(log(x)))
+  }
+)
+
+master$rank_product_rank <- rank(
+  master$rank_product,
+  ties.method = "average",
+  na.last = "keep"
+)
+```
+
+# 25. Statistical percentile score
+
+This keeps biology separate initially.
+
+```{r stats_score}
+pct_high <- function(x) {
+  out <- rep(NA_real_, length(x))
+  ok <- is.finite(x)
+  out[ok] <- dplyr::percent_rank(x[ok])
+  out
+}
+
+pct_low <- function(x) {
+  pct_high(-x)
+}
+
+master <- master |>
+  mutate(
+    score_effect = pct_high(abs(shrunkLFC)),
+    score_significance = pct_low(padj),
+    score_precision = pct_low(lfcSE),
+    score_abundance = pct_high(log1p(baseMean)),
+    score_array_effect = pct_high(abs(array_logFC)),
+    score_array_significance = pct_low(array_FDR_standard),
+    score_platform_agreement = pct_low(platform_difference)
+  )
+
+if ("loo_propFDR05" %in% colnames(master)) {
+  master$score_loo <- master$loo_propFDR05
+} else {
+  master$score_loo <- NA_real_
+}
+
+if ("edgeR_FDR" %in% colnames(master)) {
+  master$score_edgeR <- pct_low(master$edgeR_FDR)
+} else {
+  master$score_edgeR <- NA_real_
+}
+
+score_cols <- c(
+  "score_effect",
+  "score_significance",
+  "score_precision",
+  "score_abundance",
+  "score_array_effect",
+  "score_array_significance",
+  "score_platform_agreement",
+  "score_loo",
+  "score_edgeR"
+)
+
+master$stat_score <- apply(
+  as.matrix(master[, score_cols, drop = FALSE]),
+  1,
+  function(x) mean(x, na.rm = TRUE)
+)
+
+master <- master |>
+  filter(gene != excluded_gene) |>
+  arrange(desc(stat_score))
+
+head(
+  master |>
+    select(
+      gene, stat_score, rank_product_rank,
+      shrunkLFC, padj, baseMean, lfcSE,
+      array_logFC, array_FDR_standard,
+      platform_difference,
+      any_of(c("loo_propFDR05", "loo_medianRank", "edgeR_logFC", "edgeR_FDR"))
+    ),
+  30
+)
+```
+
+# 26. Pareto frontier
+
+A gene is Pareto-dominated if another gene is at least as good on every selected criterion and strictly better on at least one.
+
+```{r pareto}
+pareto_vars <- c(
+  "score_effect",
+  "score_significance",
+  "score_precision",
+  "score_array_significance",
+  "score_platform_agreement"
+)
+
+# Pareto analysis is most useful among already plausible candidates.
+# Limiting it to the strongest statistical candidates also avoids an
+# unnecessarily expensive O(n^2) comparison over all ~5,800 genes.
+pareto_df <- master |>
+  dplyr::filter(
+    dplyr::if_all(
+      dplyr::all_of(pareto_vars),
+      ~ is.finite(.x)
+    ),
+    is.finite(stat_score)
+  ) |>
+  dplyr::arrange(dplyr::desc(stat_score))
+
+# Keep at most the 500 strongest candidates.
+n_pareto <- min(500, nrow(pareto_df))
+pareto_df <- dplyr::slice_head(pareto_df, n = n_pareto)
+
+cat("Genes entering Pareto analysis:", nrow(pareto_df), "\n")
+
+if (nrow(pareto_df) > 0) {
+  X <- as.matrix(
+    pareto_df[, pareto_vars, drop = FALSE]
+  )
+  storage.mode(X) <- "double"
+
+  dominated <- rep(FALSE, nrow(X))
+
+  # A point i is dominated if another point is >= it on every criterion
+  # and > it on at least one criterion.
+  for (i in seq_len(nrow(X))) {
+    ge_all <- rowSums(
+      sweep(X, 2, X[i, ], FUN = ">=")
+    ) == ncol(X)
+
+    gt_any <- rowSums(
+      sweep(X, 2, X[i, ], FUN = ">")
+    ) > 0
+
+    ge_all[i] <- FALSE
+    dominated[i] <- any(ge_all & gt_any)
+  }
+
+  pareto_df$dominated <- dominated
+
+  pareto_front <- pareto_df |>
+    dplyr::filter(!dominated) |>
+    dplyr::arrange(dplyr::desc(stat_score))
+
+  cat(
+    "Genes on selected statistical Pareto frontier:",
+    nrow(pareto_front),
+    "\n"
+  )
+
+  print(
+    head(
+      pareto_front |>
+        dplyr::select(
+          gene,
+          stat_score,
+          dplyr::all_of(pareto_vars)
+        ),
+      30
+    )
+  )
+} else {
+  pareto_front <- pareto_df
+  warning("No genes had complete finite values for the Pareto criteria.")
+}
+```
+
+# 27. Decision-weight sensitivity
+
+This asks whether genes remain highly ranked under thousands of reasonable weighting schemes.
+
+```{r weight_sensitivity}
+weight_summary <- NULL
+
+if (run_weight_sensitivity) {
+  decision_vars <- c(
+    "score_effect",
+    "score_significance",
+    "score_precision",
+    "score_array_significance",
+    "score_platform_agreement"
+  )
+
+  decision_df <- master |>
+    filter(if_all(all_of(decision_vars), is.finite))
+
+  Xd <- as.matrix(decision_df[, decision_vars])
+
+  W <- matrix(
+    rexp(n_weight_draws * length(decision_vars)),
+    nrow = n_weight_draws,
+    ncol = length(decision_vars)
+  )
+  W <- W / rowSums(W)
+
+  score_matrix <- Xd %*% t(W)
+
+  top5_count <- integer(nrow(decision_df))
+  top10_count <- integer(nrow(decision_df))
+
+  for (j in seq_len(ncol(score_matrix))) {
+    ord <- order(score_matrix[, j], decreasing = TRUE)
+    top5_count[ord[seq_len(min(5, length(ord)))]] <-
+      top5_count[ord[seq_len(min(5, length(ord)))]] + 1
+    top10_count[ord[seq_len(min(10, length(ord)))]] <-
+      top10_count[ord[seq_len(min(10, length(ord)))]] + 1
+  }
+
+  weight_summary <- data.frame(
+    gene = decision_df$gene,
+    P_top5_weights = top5_count / n_weight_draws,
+    P_top10_weights = top10_count / n_weight_draws
+  ) |>
+    arrange(desc(P_top5_weights), desc(P_top10_weights))
+
+  print(head(weight_summary, 30))
+
+  ggplot(
+    head(weight_summary, 20),
+    aes(reorder(gene, P_top5_weights), P_top5_weights)
+  ) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = "Top-5 selection probability across random criterion weights",
+      x = NULL,
+      y = "Proportion of weighting schemes"
+    )
+}
+```
+
+# 28. Combine robustness dimensions
+
+```{r final_robustness}
+final_master <- master
+
+if (!is.null(weight_summary)) {
+  final_master <- final_master |>
+    left_join(weight_summary, by = "gene")
+}
+
+if ("loo_propFDR05" %in% colnames(final_master) &&
+    "P_top5_weights" %in% colnames(final_master)) {
+  final_master <- final_master |>
+    mutate(
+      combined_robustness =
+        sqrt(pmax(loo_propFDR05, 0) * pmax(P_top5_weights, 0))
+    )
+} else {
+  final_master$combined_robustness <- NA_real_
+}
+
+final_master <- final_master |>
+  arrange(
+    desc(combined_robustness),
+    desc(stat_score)
+  )
+```
+
+# 29. Five-gene panel visualization
+
+This is exploratory only because the sample size is small.
+
+```{r five_gene_pca}
+panel <- intersect(candidate_genes, rownames(vsd))
+
+if (length(panel) >= 2) {
+  panel_mat <- assay(vsd)[panel, , drop = FALSE]
+
+  pc_panel <- prcomp(
+    t(panel_mat),
+    center = TRUE,
+    scale. = TRUE
+  )
+
+  pc_df <- data.frame(
+    sample = rownames(pc_panel$x),
+    PC1 = pc_panel$x[, 1],
+    PC2 = pc_panel$x[, 2],
+    condition = colData[rownames(pc_panel$x), "condition"]
+  )
+
+  ggplot(pc_df, aes(PC1, PC2, shape = condition, label = sample)) +
+    geom_point(size = 4) +
+    geom_text(nudge_y = 0.2, check_overlap = TRUE) +
+    labs(
+      title = "Exploratory PCA using only the candidate-gene panel",
+      subtitle = "Not a validated classifier: n is small"
+    )
+}
+```
+
+# 30. Search for an induced/repressed anti-correlated marker pair
+
+```{r marker_pair}
+vst_mat <- assay(vsd)
+
+up_genes <- res |>
+  filter(padj < 0.05, shrunkLFC > 1) |>
+  arrange(desc(shrunkLFC)) |>
+  slice_head(n = 50) |>
+  pull(gene)
+
+down_genes <- res |>
+  filter(padj < 0.05, shrunkLFC < -1) |>
+  arrange(shrunkLFC) |>
+  slice_head(n = 50) |>
+  pull(gene)
+
+up_genes <- intersect(up_genes, rownames(vst_mat))
+down_genes <- intersect(down_genes, rownames(vst_mat))
+
+if (length(up_genes) > 0 && length(down_genes) > 0) {
+  best <- NULL
+  best_sep <- -Inf
+
+  for (u in up_genes) {
+    for (d in down_genes) {
+      marker <- vst_mat[u, ] - vst_mat[d, ]
+      means <- tapply(marker, colData$condition, mean)
+      sds <- tapply(marker, colData$condition, sd)
+
+      if (all(c("H", "N") %in% names(means))) {
+        sep <- abs(means["H"] - means["N"]) /
+          (sds["H"] + sds["N"] + 1e-8)
+
+        if (is.finite(sep) && sep > best_sep) {
+          best_sep <- sep
+          best <- list(up = u, down = d, marker = marker)
+        }
+      }
+    }
+  }
+
+  if (!is.null(best)) {
+    marker_df <- data.frame(
+      sample = names(best$marker),
+      marker_score = as.numeric(best$marker),
+      condition = colData[names(best$marker), "condition"]
+    )
+
+    ggplot(marker_df, aes(condition, marker_score)) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_jitter(width = 0.08, size = 3) +
+      labs(
+        title = paste("Exploratory two-gene marker:", best$up, "-", best$down),
+        subtitle = paste("Separation score =", round(best_sep, 2)),
+        x = "Condition",
+        y = "VST(induced gene) - VST(repressed gene)"
+      )
+
+    print(best[c("up", "down")])
+  }
+}
+```
+
+# 31. Candidate evidence table
+
+```{r candidate_table}
+candidate_evidence <- final_master |>
+  filter(gene %in% candidate_genes) |>
+  select(
+    gene,
+    baseMean,
+    log2FoldChange,
+    shrunkLFC,
+    lfcSE,
+    padj,
+    effectTestPadj,
+    svalue,
+    maxCook,
+    array_logFC,
+    array_FDR_standard,
+    array_FDR_robust,
+    array_FDR_treat,
+    array_sd,
+    direction_same,
+    platform_difference,
+    any_of(c(
+      "loo_propFDR05",
+      "loo_medianLFC",
+      "loo_sdLFC",
+      "loo_medianRank",
+      "loo_worstRank",
+      "edgeR_logFC",
+      "edgeR_FDR",
+      "rank_product_rank",
+      "stat_score",
+      "P_top5_weights",
+      "P_top10_weights",
+      "combined_robustness"
+    ))
+  )
+
+candidate_evidence
+```
+
+# 32. Heatmap of candidate evidence scores
+
+```{r evidence_heatmap, fig.height=6}
+score_heat <- final_master |>
+  filter(gene %in% candidate_genes) |>
+  select(
+    gene,
+    score_effect,
+    score_significance,
+    score_precision,
+    score_abundance,
+    score_array_effect,
+    score_array_significance,
+    score_platform_agreement,
+    score_loo,
+    score_edgeR
+  )
+
+if (nrow(score_heat) > 0) {
+  rownames(score_heat) <- score_heat$gene
+  score_heat$gene <- NULL
+
+  if (requireNamespace("pheatmap", quietly = TRUE)) {
+    pheatmap::pheatmap(
+      as.matrix(score_heat),
+      cluster_rows = FALSE,
+      cluster_cols = FALSE,
+      main = "Candidate evidence profile (0-1 percentile scores)"
+    )
+  }
+}
+```
+
+# 33. Export master results and useful selection-stage tables
+
+This section writes all major result tables into the same folder as this Rmd file.
+That makes them easy to find in RStudio's **Files** pane.
+
+```{r export}
+output_dir <- getwd()
+
+write.csv(final_master, file=file.path(output_dir, "01_complete_gene_ranking.csv"), row.names=FALSE)
+write.csv(pareto_front, file=file.path(output_dir, "02_pareto_frontier_genes.csv"), row.names=FALSE)
+
+top_candidates <- final_master |>
+  dplyr::arrange(dplyr::desc(combined_robustness), dplyr::desc(stat_score)) |>
+  dplyr::slice_head(n = min(100, nrow(final_master)))
+write.csv(top_candidates, file=file.path(output_dir, "03_top_100_candidates.csv"), row.names=FALSE)
+
+write.csv(rescued, file=file.path(output_dir, "04_rescued_candidates.csv"), row.names=FALSE)
+write.csv(fragile, file=file.path(output_dir, "05_fragile_original_hits.csv"), row.names=FALSE)
+write.csv(discordant, file=file.path(output_dir, "06_cross_platform_discordant.csv"), row.names=FALSE)
+
+if (!is.null(weight_summary)) {
+  write.csv(weight_summary, file=file.path(output_dir, "07_weight_sensitivity.csv"), row.names=FALSE)
+}
+
+write.csv(candidate_evidence, file=file.path(output_dir, "08_final_candidate_evidence.csv"), row.names=FALSE)
+
+if (!is.null(loo_summary)) {
+  write.csv(loo_summary, file=file.path(output_dir, "09_leave_one_out_summary.csv"), row.names=FALSE)
+}
+
+if (!is.null(edgeR_table)) {
+  write.csv(edgeR_table, file=file.path(output_dir, "10_edgeR_results.csv"), row.names=FALSE)
+}
+
+write.csv(array_compare, file=file.path(output_dir, "11_microarray_limma_results.csv"), row.names=FALSE)
+write.csv(merged, file=file.path(output_dir, "12_rnaseq_microarray_merged.csv"), row.names=FALSE)
+write.csv(grid, file=file.path(output_dir, "13_threshold_sensitivity_grid.csv"), row.names=FALSE)
+write.csv(cand_threshold, file=file.path(output_dir, "14_candidate_threshold_stability.csv"), row.names=FALSE)
+
+cat("Exported files to:\n", output_dir, "\n\n")
+cat("Row counts:\n")
+cat("Complete master ranking:", nrow(final_master), "\n")
+cat("Pareto frontier:", nrow(pareto_front), "\n")
+cat("Top shortlist:", nrow(top_candidates), "\n")
+cat("Rescued candidates:", nrow(rescued), "\n")
+cat("Fragile original hits:", nrow(fragile), "\n")
+cat("Cross-platform discordant:", nrow(discordant), "\n")
+cat("Current nominated candidates:", nrow(candidate_evidence), "\n")
+```
+
+# 34. Optional command-line / BAM sensitivity plan
+
+These commands require the original BAM files and a compatible BED/GTF annotation, so they are **not executed automatically**. Do not change parameters merely to maximize favorite genes; compare biologically reasonable alternatives.
+
+```{bash, eval=FALSE}
+# Inspect BAM mapping summaries
+samtools flagstat sample.bam
+samtools stats sample.bam > sample.stats.txt
+
+# If RSeQC is available, infer library strandedness
+infer_experiment.py -r genes.bed -i sample.bam
+
+# BEDTools counting sensitivity:
+# - default
+bedtools multicov -bams sample.bam -bed genes.bed > counts_default.txt
+
+# - same-strand counting (only if the library orientation warrants it)
+bedtools multicov -s -bams sample.bam -bed genes.bed > counts_stranded.txt
+
+# - split alignments (important to test for RNA-seq gene/exon counting)
+bedtools multicov -split -bams sample.bam -bed genes.bed > counts_split.txt
+
+# - mapping quality sensitivity
+bedtools multicov -q 20 -bams sample.bam -bed genes.bed > counts_mapq20.txt
+bedtools multicov -q 30 -bams sample.bam -bed genes.bed > counts_mapq30.txt
+
+# Independent counting with featureCounts; adjust -s after strandedness check.
+featureCounts -T 8 -s 0 -a annotation.gtf -o counts_featureCounts.txt *.bam
+```
+
+# 35. Optional pathway/GSEA preparation
+
+This script exports a complete ranked list suitable for `fgsea`/`clusterProfiler`. Gene-set definitions for *C. parapsilosis* must be supplied separately and should be documented.
+
+```{r gsea_export}
+gsea_ranks <- res |>
+  filter(is.finite(stat)) |>
+  arrange(desc(stat)) |>
+  select(gene, stat)
+
+write.table(
+  gsea_ranks,
+  file = "~/extended_GSEA_ranked_genes.tsv",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+```
+
+# 36. Reproducibility
+
+```{r reproducibility}
+format(Sys.time(), "%d %B, %Y, %H:%M")
+sessionInfo()
+```

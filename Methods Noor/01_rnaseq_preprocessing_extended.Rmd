@@ -1,0 +1,316 @@
+---
+title: "RNA-seq preprocessing and quality control — extended analysis"
+author: "Adapted from ENS practical scripts"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(fig.align="center", fig.width=8, fig.height=6)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(dplyr)
+  library(reshape2)
+  library(ggplot2)
+})
+
+theme_set(theme_classic())
+
+# ---------- USER SETTINGS ----------
+count_file <- "/shared/projects/tp_2636_usorbonne_geno_transcriptomic_184414/data/rnaseq/count_data_diffAnalysis_no0counts.txt"
+design_file <- "/shared/projects/tp_2636_usorbonne_geno_transcriptomic_184414/data/rnaseq/design.txt"
+
+# Keep this FALSE for the first run. Turn TRUE only if you want the optional low-count sensitivity analysis.
+run_prefilter_sensitivity <- TRUE
+
+# Example candidate genes; edit freely.
+candidate_genes <- c(
+  "CPAR2_603610",
+  "CPAR2_100710",
+  "CPAR2_201490",
+  "CPAR2_405010",
+  "CPAR2_203450"
+)
+excluded_gene <- "CPAR2_404850"
+```
+
+# 1. Load and validate the data
+
+```{r load}
+countData <- read.table(
+  count_file,
+  row.names = 1,
+  header = TRUE,
+  check.names = FALSE
+)
+
+colData <- read.table(
+  design_file,
+  row.names = 1,
+  header = TRUE,
+  check.names = FALSE
+)
+
+# Force exact sample matching/order.
+stopifnot(all(colnames(countData) %in% rownames(colData)))
+colData <- colData[colnames(countData), , drop = FALSE]
+stopifnot(identical(colnames(countData), rownames(colData)))
+
+# Make the reference level explicit.
+colData$condition <- factor(colData$condition)
+if ("N" %in% levels(colData$condition)) {
+  colData$condition <- relevel(colData$condition, ref = "N")
+}
+
+cat("Count matrix:", nrow(countData), "genes x", ncol(countData), "samples\n")
+cat("Samples per condition:\n")
+print(table(colData$condition))
+cat("Total zeros:", sum(countData == 0), "\n")
+```
+
+# 2. Basic library-size QC
+
+```{r library_sizes}
+libsize_df <- data.frame(
+  sample = colnames(countData),
+  library_size = colSums(countData),
+  condition = colData$condition
+)
+
+ggplot(libsize_df, aes(sample, library_size, fill = condition)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Raw library sizes",
+    x = NULL,
+    y = "Total mapped counts"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# 3. DESeq2 object and standard normalization
+
+```{r dds}
+dds <- DESeqDataSetFromMatrix(
+  countData = round(as.matrix(countData)),
+  colData = colData,
+  design = ~ condition
+)
+
+# Canonical DESeq2 pipeline will estimate size factors, dispersions and the Wald model.
+dds <- DESeq(dds)
+
+cat("Size factors:\n")
+print(sizeFactors(dds))
+cat("\nModel coefficients:\n")
+print(resultsNames(dds))
+```
+
+# 4. Distribution before and after normalization
+
+This version does **not** hard-code `5788` genes or assume a fixed sample order.
+
+```{r boxplots, fig.height=8}
+make_long_counts <- function(mat, metadata) {
+  x <- melt(log2(mat + 1))
+  colnames(x) <- c("ORF", "Samples", "Expr.Val")
+  x$Condition <- metadata[as.character(x$Samples), "condition"]
+  x
+}
+
+Raw.data <- make_long_counts(counts(dds), colData)
+Norm.data <- make_long_counts(counts(dds, normalized = TRUE), colData)
+
+ggplot(Raw.data, aes(Samples, Expr.Val, fill = Condition)) +
+  geom_boxplot(outlier.size = 0.3) +
+  labs(
+    title = "Expression distributions before normalization",
+    x = NULL,
+    y = expression(log[2](count + 1))
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(Norm.data, aes(Samples, Expr.Val, fill = Condition)) +
+  geom_boxplot(outlier.size = 0.3) +
+  labs(
+    title = "Expression distributions after DESeq2 normalization",
+    x = NULL,
+    y = expression(log[2](normalized~count + 1))
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# 5. Dispersion diagnostics
+
+```{r dispersion}
+plotDispEsts(dds)
+```
+
+# 6. VST, PCA and sample-level QC
+
+For unbiased exploratory QC, use `blind=TRUE`. We also compute `blind=FALSE` for downstream candidate visualization.
+
+```{r vst}
+vsd_blind <- vst(dds, blind = TRUE)
+vsd_design <- vst(dds, blind = FALSE)
+```
+
+```{r pca, fig.height=7}
+pca <- plotPCA(vsd_blind, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(pca, "percentVar"), 1)
+
+ggplot(pca, aes(PC1, PC2, shape = condition, label = name)) +
+  geom_point(size = 4) +
+  geom_text(nudge_y = 0.25, check_overlap = TRUE) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ggtitle("PCA of samples (blind VST)")
+```
+
+# 7. Pairwise replicate correlations
+
+```{r correlations, fig.height=8}
+vmat <- assay(vsd_blind)
+
+pearson_cor <- cor(vmat, method = "pearson")
+spearman_cor <- cor(vmat, method = "spearman")
+
+if (requireNamespace("pheatmap", quietly = TRUE)) {
+  pheatmap::pheatmap(
+    pearson_cor,
+    main = "Pearson correlation between samples"
+  )
+  pheatmap::pheatmap(
+    spearman_cor,
+    main = "Spearman correlation between samples"
+  )
+} else {
+  image(pearson_cor, main = "Pearson sample correlation")
+  image(spearman_cor, main = "Spearman sample correlation")
+}
+```
+
+# 8. Sample-to-sample distances
+
+```{r sample_distances, fig.height=8}
+sampleDists <- dist(t(vmat))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+if (requireNamespace("pheatmap", quietly = TRUE)) {
+  pheatmap::pheatmap(
+    sampleDistMatrix,
+    main = "VST sample-to-sample distances"
+  )
+} else {
+  image(sampleDistMatrix, main = "VST sample distances")
+}
+```
+
+# 9. Cook's distance diagnostics
+
+High Cook's distance can flag genes strongly influenced by one sample.
+
+```{r cooks}
+cooks <- assays(dds)[["cooks"]]
+maxCook <- apply(cooks, 1, max, na.rm = TRUE)
+
+cook_df <- data.frame(
+  gene = names(maxCook),
+  maxCook = maxCook
+)
+
+ggplot(cook_df, aes(maxCook)) +
+  geom_histogram(bins = 100) +
+  scale_x_log10() +
+  labs(
+    title = "Distribution of maximum Cook's distance per gene",
+    x = "Maximum Cook's distance (log10 scale)",
+    y = "Genes"
+  )
+
+head(cook_df[order(cook_df$maxCook, decreasing = TRUE), ], 20)
+```
+
+# 10. Candidate-level normalized expression
+
+```{r candidate_counts, fig.height=5}
+candidate_present <- intersect(candidate_genes, rownames(dds))
+
+if (length(candidate_present) == 0) {
+  cat("None of the default candidate IDs are present. Edit candidate_genes in the setup chunk.\n")
+} else {
+  for (g in candidate_present) {
+    dat <- plotCounts(
+      dds,
+      gene = g,
+      intgroup = "condition",
+      returnData = TRUE
+    )
+    p <- ggplot(dat, aes(condition, count)) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_jitter(width = 0.08, height = 0, size = 2.8) +
+      scale_y_log10() +
+      labs(
+        title = paste("Normalized counts:", g),
+        x = "Condition",
+        y = "Normalized count (log10 scale)"
+      )
+    print(p)
+  }
+}
+```
+
+# 11. Optional low-count filtering sensitivity
+
+This does not replace the main analysis. It checks whether conclusions are sensitive to weakly informative genes.
+
+```{r filter_sensitivity}
+if (run_prefilter_sensitivity) {
+  keep_10x3 <- rowSums(countData >= 10) >= 3
+
+  cat("Genes before filtering:", nrow(countData), "\n")
+  cat("Genes retained by >=10 counts in >=3 samples:", sum(keep_10x3), "\n")
+
+  countData_f <- countData[keep_10x3, , drop = FALSE]
+
+  dds_f <- DESeqDataSetFromMatrix(
+    countData = round(as.matrix(countData_f)),
+    colData = colData,
+    design = ~ condition
+  )
+  dds_f <- DESeq(dds_f, quiet = TRUE)
+
+  res_main <- results(dds, contrast = c("condition", "H", "N"))
+  res_f <- results(dds_f, contrast = c("condition", "H", "N"))
+
+  common <- intersect(rownames(res_main), rownames(res_f))
+  filter_compare <- data.frame(
+    gene = common,
+    LFC_unfiltered = res_main[common, "log2FoldChange"],
+    LFC_filtered = res_f[common, "log2FoldChange"]
+  )
+
+  ggplot(filter_compare, aes(LFC_unfiltered, LFC_filtered)) +
+    geom_point(alpha = 0.25) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2) +
+    labs(
+      title = "Sensitivity to low-count filtering",
+      x = "log2FC: supplied no-zero-count matrix",
+      y = "log2FC: >=10 counts in >=3 samples"
+    )
+}
+```
+
+# 12. Reproducibility
+
+```{r reproducibility}
+format(Sys.time(), "%d %B, %Y, %H:%M")
+sessionInfo()
+```
